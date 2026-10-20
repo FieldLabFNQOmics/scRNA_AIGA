@@ -4,7 +4,18 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── 0. Fix here() root before anything else ────────────────────────────────────
-PROJECT_ROOT <- "/g/data/pq84/single_cell/10X/scRNA_auto/all_data/GIMR_GGP_CIRCA_20250513_5P"
+
+args <- commandArgs(trailingOnly = TRUE)
+PROJECT_ROOT<- if (length(args) >= 1) args[1] else getwd()
+if (PROJECT_ROOT == "test"){
+PROJECT_ROOT <- "/g/data/pq84/sarahhp/projects/scauto/test_data"}
+
+if (all(!file.exists(file.path(PROJECT_ROOT, ".here")),
+        !grepl("\\.Rproj",list.files(PROJECT_ROOT)))) {
+  stop("project_root (", PROJECT_ROOT, ") doesn't look right — ",
+       "expected to find .Rproj or .here file in dir. ",
+       "Did you cd into the project directory before running?")
+}
 
 setwd(PROJECT_ROOT)
 try(detach("package:here", unload = TRUE), silent = TRUE)
@@ -17,6 +28,11 @@ if (here() != PROJECT_ROOT) {
   ))
 }
 cat("✔ Project root:", here(), "\n")
+
+utility_file <- "/g/data/pq84/sarahhp/projects/scauto/utility_seuratv5.R" # new utility file
+if (!file.exists(utility_file)) stop(glue("utility.R not found: {utility_file}"))
+
+options(future.globals.maxSize = 32 * 1024^3)  # 8 GiB, adjust to data size
 
 # ── 1. Libraries ───────────────────────────────────────────────────────────────
 suppressPackageStartupMessages({
@@ -33,11 +49,14 @@ suppressPackageStartupMessages({
   library(scales)
 })
 
-dir.create(here("output", "figures", "Integration"), recursive = TRUE, showWarnings = FALSE)
-dir.create(here("output", "figures", "CellType"),    recursive = TRUE, showWarnings = FALSE)
+int_methods = c("RPCA","Harmony")
+for (m in int_methods) {
+  dir.create(here("output", "figures", m), recursive = TRUE, showWarnings = FALSE)
+}
+dir.create(here("output", "figures", "CellType"), recursive = TRUE, showWarnings = FALSE)
 
 # ── 2. Load central donor metadata ─────────────────────────────────────────────
-donor_meta_file <- here("data", "metadata", "donor_meta.csv")
+donor_meta_file <- here("data", "meta_data", "donor_meta.csv")
 
 if (!file.exists(donor_meta_file)) {
   stop(glue(
@@ -56,7 +75,7 @@ donor_levels   <- c(donor_meta$donor_short, "doublet", "unassigned")
 
 cat("✔ Donor metadata loaded:\n")
 print(donor_meta[, c("donor_short", "cohort", "disease", "pool")])
-cat(glue("Cohort levels: {paste(cohort_levels, collapse = ' > ')}\n"))
+cat(glue("Cohort levels: {paste(cohort_levels, collapse = ' > ')} \n"))
 
 # ── Helper: attach cohort / disease / sex to Seurat object ────────────────────
 attach_donor_meta <- function(seu_obj, meta = donor_meta) {
@@ -69,24 +88,33 @@ attach_donor_meta <- function(seu_obj, meta = donor_meta) {
 
 # ── 3. Gene filter function ────────────────────────────────────────────────────
 c2_sets <- msigdbr(species = "Homo sapiens", category = "C2")
+symbol_colname =  intersect(c("db_gene_symbol", "human_gene_symbol"), names(c2_sets))[1]
 
 filter_genes <- function(sce) {
+  unannot = rownames(sce)[is.na(rowData(sce)$ID)]
+  if (length(unannot) > 0) {
+      warning(sprintf("Removing %d genes without Gene 'ID' annotations",
+              length(unannot)))
+      unannot_filt = rownames(sce) %in% unannot
+      sce = sce[!unannot_filt,]
+              }
   mito   <- rownames(sce)[rowData(sce)$CHR == "MT"]
   ribo   <- union(
     grep("^RP(S|L)", rownames(sce), value = TRUE),
-    c2_sets[c2_sets$gs_name == "KEGG_RIBOSOME", ]$human_gene_symbol
+    c2_sets[c2_sets$gs_name == "KEGG_RIBOSOME", ][symbol_colname]
   )
-  sex    <- rownames(sce)[rowData(sce)$CHR %in% c("X", "Y")]
+  #sex    <- rownames(sce)[rowData(sce)$CHR %in% c("X", "Y") ]
   pseudo <- rownames(sce)[grepl("pseudogene",
                                 rowData(sce)$ENSEMBL.GENEBIOTYPE,
-                                ignore.case = TRUE)]
+                                ignore.case = TRUE) ]
   
-  uninformative <- rownames(sce) %in% c(mito, ribo, sex, pseudo)
+  uninformative <- rownames(sce) %in% c(mito, ribo, #sex,
+                                        pseudo)
   junk          <- sce$genetic_donor %in% c("doublet", "unassigned") |
     sce$cell_status   == "empty_droplet"
   
-  cat(glue("  Uninformative genes removed: {sum(uninformative)}\n"))
-  cat(glue("  Junk cells removed:          {sum(junk)}\n"))
+  cat(glue("  Uninformative genes removed: {sum(uninformative)} \n"))
+  cat(glue("  Junk cells removed:          {sum(junk)} \n\n"))
   
   sce[!uninformative, !junk]
 }
@@ -94,60 +122,73 @@ filter_genes <- function(sce) {
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN — build or load annotated Seurat object
 # ══════════════════════════════════════════════════════════════════════════════
-out_file <- here("data", "SCEs", "Pools_A_B.annotated.SEU.rds")
+
+pool_names = unique(donor_meta$pool)
+#Add "Pool_" prefix  per name if pool names are short like "A", "B"
+full_pool_names <- ifelse(
+  stringr::str_length(pool_names) < 2,
+  paste0("Pool_", pool_names),
+  pool_names
+)
+
+#Naming convention for output file
+#Only save file as "Pools_{pool1}_{pool2}" if  there are 3 or less pools
+if (length(pool_names)<4){
+    joint_name = paste0("Pools_",paste(pool_names, collapse="_"))
+} else {
+    joint_name = paste0("All_pools_", format(Sys.Date("%Y-%m-%d")))
+}
+
+out_file <- here("data", "SCEs", glue("{joint_name}.annotated.SEU.rds"))
 
 if (file.exists(out_file)) {
   cat("✔ Annotated object exists — loading\n")
   seu <- readRDS(out_file)
   
 } else {
-  
-  # ── Load and filter Pool A ───────────────────────────────────────────────────
-  cat(glue("\n{strrep('─', 50)}\n  Filtering Pool A\n{strrep('─', 50)}\n"))
-  sce_A_file <- here("data", "SCEs", "Pool_A.preprocessed.SCE.rds")
-  if (!file.exists(sce_A_file)) stop(glue("Missing: {sce_A_file}"))
-  
-  sce_A    <- readRDS(sce_A_file)
-  sceFlt_A <- filter_genes(sce_A)
-  sceFlt_A$pool <- "Pool_A"
-  colnames(sceFlt_A) <- paste0(colnames(sceFlt_A), "_A")
-  cat(glue("  Pool A cells after filter: {ncol(sceFlt_A)}\n"))
-  
-  # ── Load and filter Pool B ───────────────────────────────────────────────────
-  cat(glue("\n{strrep('─', 50)}\n  Filtering Pool B\n{strrep('─', 50)}\n"))
-  sce_B_file <- here("data", "SCEs", "Pool_B.preprocessed.SCE.rds")
-  if (!file.exists(sce_B_file)) stop(glue("Missing: {sce_B_file}"))
-  
-  sce_B    <- readRDS(sce_B_file)
-  sceFlt_B <- filter_genes(sce_B)
-  sceFlt_B$pool <- "Pool_B"
-  colnames(sceFlt_B) <- paste0(colnames(sceFlt_B), "_B")
-  cat(glue("  Pool B cells after filter: {ncol(sceFlt_B)}\n"))
-  
-  # ── Shared genes ─────────────────────────────────────────────────────────────
-  shared_genes <- intersect(rownames(sceFlt_A), rownames(sceFlt_B))
-  cat(glue("\n  Shared genes: {length(shared_genes)}\n"))
-  sceFlt_A <- sceFlt_A[shared_genes, ]
-  sceFlt_B <- sceFlt_B[shared_genes, ]
-  
-  # ── Remove low-abundance genes ───────────────────────────────────────────────
-  combined_counts <- cbind(counts(sceFlt_A), counts(sceFlt_B))
-  keep            <- rowSums(combined_counts > 0) > 20
-  cat(glue("  Genes kept (>20 cells expressing): {sum(keep)}\n"))
-  sceFlt_A <- sceFlt_A[keep, ]
-  sceFlt_B <- sceFlt_B[keep, ]
-  
-
-  # ── Combine into single SCE ──────────────────────────────────────────────────
-  combined_counts  <- cbind(counts(sceFlt_A),  counts(sceFlt_B))
-  combined_colData <- rbind(colData(sceFlt_A), colData(sceFlt_B))
-  
-  sce_combined <- SingleCellExperiment(
-    list(counts = combined_counts),
-    colData = combined_colData,
-    rowData = rowData(sceFlt_A)
-  )
-  cat(glue("\n  Combined: {ncol(sce_combined)} cells × {nrow(sce_combined)} genes\n"))
+  for (pool in full_pool_names){
+    
+    
+    # ── Load and filter each pool ────────────────────────────────────────────
+    sce_list <- lapply(full_pool_names, function(pool) {
+      cat(glue("\n{strrep('─', 50)}\n  Filtering Pool {pool}\n{strrep('─', 50)}\n"))
+      
+      sce_file <- here("data", "SCEs", glue("{pool}.preprocessed.SCE.rds"))
+      if (!file.exists(sce_file)) stop(glue("Missing: {sce_file}"))
+      
+      sce_this    <- readRDS(sce_file)
+      sceFlt_this <- filter_genes(sce_this)
+      sceFlt_this$pool <- pool
+      colnames(sceFlt_this) <- paste0(colnames(sceFlt_this), "_", pool)
+      
+      cat(glue("  Pool {pool} cells after filter: {ncol(sceFlt_this)}\n"))
+      sceFlt_this
+    })
+    names(sce_list) <- full_pool_names
+    
+    # ── Shared genes across all pools ────────────────────────────────────────
+    shared_genes <- Reduce(intersect, lapply(sce_list, rownames))
+    cat(glue("\n  Shared genes across {length(sce_list)} pools: {length(shared_genes)}\n"))
+    sce_list <- lapply(sce_list, function(x) x[shared_genes, ])
+    
+    # ── Remove low-abundance genes (pooled across all pools) ─────────────────
+    combined_counts <- do.call(cbind, lapply(sce_list, counts))
+    keep <- rowSums(combined_counts > 0) > 20
+    cat(glue("  Genes kept (>20 cells expressing): {sum(keep)}\n"))
+    sce_list <- lapply(sce_list, function(x) x[keep, ])
+    
+    # ── Combine into a single SCE ────────────────────────────────────────────
+    combined_counts  <- do.call(cbind, lapply(sce_list, counts))
+    combined_colData <- do.call(rbind, lapply(sce_list, colData))
+    
+    sce_combined <- SingleCellExperiment(
+      list(counts = combined_counts),
+      colData = combined_colData,
+      rowData = rowData(sce_list[[1]])   # identical across pools post-filtering
+    )
+    
+    cat(glue("\n  Combined: {ncol(sce_combined)} cells × {nrow(sce_combined)} genes\n"))
+  }
   
   # ── Convert to Seurat ────────────────────────────────────────────────────────
   cnt           <- counts(sce_combined)
@@ -158,23 +199,21 @@ if (file.exists(out_file)) {
     meta.data = data.frame(colData(sce_combined))
   )
   
-  # ── SCTransform integration across donors ─────────────────────────────────────
+  # ── SCTransform and integration across donors ─────────────────────────────────────
   cat(glue("\n{strrep('─', 50)}\n  Integrating across donors\n{strrep('─', 50)}\n"))
   
-  utility_file <- here("code", "utility.R")
-  if (!file.exists(utility_file)) stop(glue("utility.R not found: {utility_file}"))
   source(utility_file)
   
   seu_integrated <- intDat(seu_combined, split = "genetic_donor", type = "RNA")
+  #v5 object contains latent dimensions & UMAPs for each integration method
+  #integrated is no longer its own assay; instead SCT assay contains normalised counts
   
   # ── Dimensionality reduction ─────────────────────────────────────────────────
-  DefaultAssay(seu_integrated) <- "integrated"
+  # calculating the pre-integration UMAP (SCT)
+  DefaultAssay(seu_integrated) <- "SCT" #integrated is no longer its own assay
   seu_integrated <- seu_integrated %>%
-    ScaleData(verbose = FALSE) %>%
-    RunPCA(npcs = 30, verbose = FALSE) %>%
-    RunUMAP(dims = 1:30, verbose = FALSE)
-  
-  VariableFeatures(seu_integrated) <- rownames(seu_integrated@assays$integrated)
+    RunUMAP(dims = 1:30, verbose = FALSE, 
+            reduction = "pca", reduction.name="sct.umap")
   
   cat(glue("  PCA and UMAP complete\n"))
   
@@ -211,47 +250,52 @@ cohort_colours <- setNames(
   cohort_levels
 )
 
-# ── UMAP: integration QC ──────────────────────────────────────────────────────
-pdf(here("output", "figures", "Integration", "UMAP_integration.pdf"),
-    width = 18, height = 6)
-print(
-  DimPlot(seu, group.by = "pool",          pt.size = 0.3)                 +
-    DimPlot(seu, group.by = "genetic_donor", pt.size = 0.3)                 +
-    DimPlot(seu, group.by = "cohort",        pt.size = 0.3,
-            cols = cohort_colours)
-)
-dev.off()
-cat("  ✔ UMAP_integration.pdf\n")
+for (m in int_methods){
+  DefaultDimReduc(seu) = paste(tolower(m), "umap", sep=".")
+  # ── UMAP: integration QC ──────────────────────────────────────────────────────
+  pdf(here("output", "figures", m, "UMAP_integration.pdf"),
+      width = 18, height = 6)
+  print(
+    DimPlot(seu, group.by = "pool",          pt.size = 0.3, shuffle = T)  +
+      DimPlot(seu, group.by = "genetic_donor", pt.size = 0.3, shuffle=T)  +
+      DimPlot(seu, group.by = "cohort",        pt.size = 0.3,
+              cols = cohort_colours, shuffle=T)
+  )
+  dev.off()
+  cat(sprintf("  ✔ %s/UMAP_integration.pdf\n",m))
+  
+  # ── UMAP: cell types ──────────────────────────────────────────────────────────
+  pdf(here("output", "figures",m, "UMAP_celltypes_l1.pdf"),
+      width = 10, height = 8)
+  print(
+    DimPlot(seu, group.by = "predicted.celltype.l1",
+            label = TRUE, pt.size = 0.3, repel = TRUE) + NoLegend()
+  )
+  dev.off()
+  
+  pdf(here("output", "figures", m, "UMAP_celltypes_l2.pdf"),
+      width = 12, height = 10)
+  print(
+    DimPlot(seu, group.by = "predicted.celltype.l2",
+            label = TRUE, pt.size = 0.3, repel = TRUE) + NoLegend()
+  )
+  dev.off()
+  cat(sprintf("  ✔ %s/UMAP_celltypes.pdf\n", m))
+  
+  # ── UMAP: per donor ───────────────────────────────────────────────────────────
+  pdf(here("output", "figures", m, "UMAP_per_donor.pdf"),
+      width = 18, height = 10)
+  print(
+    DimPlot(seu, group.by = "predicted.celltype.l2",
+            split.by = "genetic_donor",
+            label = TRUE, pt.size = 0.3, repel = TRUE, ncol = 3) +
+      NoLegend()
+  )
+  dev.off()
+  cat("  ✔ UMAP_per_donor.pdf\n")
+}
 
-# ── UMAP: cell types ──────────────────────────────────────────────────────────
-pdf(here("output", "figures", "CellType", "UMAP_celltypes_l1.pdf"),
-    width = 10, height = 8)
-print(
-  DimPlot(seu, group.by = "predicted.celltype.l1",
-          label = TRUE, pt.size = 0.3, repel = TRUE) + NoLegend()
-)
-dev.off()
 
-pdf(here("output", "figures", "CellType", "UMAP_celltypes_l2.pdf"),
-    width = 12, height = 10)
-print(
-  DimPlot(seu, group.by = "predicted.celltype.l2",
-          label = TRUE, pt.size = 0.3, repel = TRUE) + NoLegend()
-)
-dev.off()
-cat("  ✔ UMAP_celltypes.pdf\n")
-
-# ── UMAP: per donor ───────────────────────────────────────────────────────────
-pdf(here("output", "figures", "CellType", "UMAP_per_donor.pdf"),
-    width = 18, height = 10)
-print(
-  DimPlot(seu, group.by = "predicted.celltype.l2",
-          split.by = "genetic_donor",
-          label = TRUE, pt.size = 0.3, repel = TRUE, ncol = 3) +
-    NoLegend()
-)
-dev.off()
-cat("  ✔ UMAP_per_donor.pdf\n")
 
 # ── Cell type × cohort composition barplot ─────────────────────────────────────
 celltype_cohort <- as.data.frame(table(
@@ -289,5 +333,5 @@ cat("\n  Donor × cohort:\n")
 print(table(Donor = seu$genetic_donor, Cohort = seu$cohort))
 
 cat(glue("\n{strrep('═', 50)}\n  INTEGRATION & ANNOTATION COMPLETE\n{strrep('═', 50)}\n"))
-cat(glue("  Output: {out_file}\n"))
+cat(glue("  Output: {out_file}\n\n"))
 

@@ -5,7 +5,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── 0. Fix here() root before anything else ────────────────────────────────────
-PROJECT_ROOT <- "/g/data/pq84/single_cell/10X/scRNA_auto/all_data/GIMR_GGP_CIRCA_20250513_5P"
+PROJECT_ROOT <- "/g/data/tb21/sp0427/projects/onek1k"
 
 setwd(PROJECT_ROOT)
 try(detach("package:here", unload = TRUE), silent = TRUE)
@@ -23,14 +23,14 @@ cat("✔ Project root:", here(), "\n")
 suppressPackageStartupMessages({
   library(here)
   library(SingleCellExperiment)
-  library(scater)
+  library(scater)#install
   library(scuttle)
   library(EnsDb.Hsapiens.v86)
   library(msigdbr)
   library(glue)
   library(dplyr)
-  library(DropletUtils)
-  library(scDblFinder)
+  library(DropletUtils)#install
+  library(scDblFinder)#install
 })
 
 dir.create(here("output", "figures", "QC"), recursive = TRUE, showWarnings = FALSE)
@@ -41,7 +41,7 @@ donor_meta_file <- here("data", "meta_data", "donor_meta.csv")
 if (!file.exists(donor_meta_file)) {
   stop(glue(
     "donor_meta.csv not found: {donor_meta_file}\n",
-    "Run 00_create_donor_metadata.R first."
+    "Run 00_create_donor_metadata.R first." ## This script doesn't exist???
   ))
 }
 
@@ -58,6 +58,14 @@ donor_mapping <- setNames(
 
 donor_levels <- c(donor_meta$donor_short, "doublet", "unassigned")
 
+pool_names = unique(donor_meta$pool)
+#Only add "Pool_" if pool names are short like "A", "B"
+full_pool_names <- ifelse(
+  stringr::str_length(pool_names) < 2,
+  paste0("Pool_", pool_names),
+  pool_names
+)
+
 # ── 3. Ribosomal gene set (computed once) ──────────────────────────────────────
 c2_sets  <- msigdbr(species = "Homo sapiens", category = "C2")
 ribo_set <- character(0)
@@ -65,9 +73,9 @@ ribo_set <- character(0)
 # ══════════════════════════════════════════════════════════════════════════════
 # PREPROCESS EACH POOL
 # ══════════════════════════════════════════════════════════════════════════════
-for (i in c("A", "B")) {
+for (i in pool_names) {
   
-  out_file <- here("data", "SCEs", glue("Pool_{i}.preprocessed.SCE.rds"))
+  out_file <- here("data", "SCEs", glue("{i}.preprocessed.SCE.rds"))
   
   if (file.exists(out_file)) {
     cat(glue("✔ Pool {i} already preprocessed — skipping\n"))
@@ -77,15 +85,24 @@ for (i in c("A", "B")) {
   cat(glue("\n{strrep('─', 50)}\n  Preprocessing Pool {i}\n{strrep('─', 50)}\n"))
   
   # ── Load CellRanger SCE ─────────────────────────────────────────────────────
-  sce_file <- here("data", "SCEs", glue("Pool_{i}.CellRanger.SCE.rds"))
+  sce_file <- here("data", "SCEs", glue("{i}.CellRanger.SCE.rds"))
   if (!file.exists(sce_file)) stop(glue("CellRanger SCE not found: {sce_file}"))
   
   sce <- readRDS(sce_file)
   cat("  Cells loaded:", ncol(sce), "\n")
   
   # ── Identify empty droplets ─────────────────────────────────────────────────
-  sce$capture <- factor(sce$Sample)
-  capture_names <- setNames(levels(sce$capture), levels(sce$capture))
+  #cellRanger automatically runs emptyDrops, this step might not be necessary for filtered 10x 
+  #matrices
+  if ("Sample" %in% colnames(colData(sce))){
+    sce$capture <- factor(sce$Sample)
+    capture_names <- setNames(levels(sce$capture), levels(sce$capture))
+  } else { 
+    warning("'Sample' field not found in SCE; using genetic_donor")
+    sce$capture <- factor(sce$genetic_donor)
+    capture_names <- setNames(levels(sce$capture), levels(sce$capture))
+  }
+  
   
   empties <- do.call(rbind, lapply(capture_names, function(cn) {
     emp_file <- here("data", "emptyDrops", paste0(cn, ".emptyDrops.rds"))
@@ -108,7 +125,7 @@ for (i in c("A", "B")) {
   }
   
   # ── Doublet detection ───────────────────────────────────────────────────────
-  dbl_out <- here("data", "SCEs", glue("Pool_{i}_doublets.rds"))
+  dbl_out <- here("data", "SCEs", glue("{i}_doublets.rds"))
   
   if (!file.exists(dbl_out)) {
     cat("  Running doublet detection...\n")
@@ -118,7 +135,7 @@ for (i in c("A", "B")) {
     saveRDS(dbl_df, file = dbl_out)
     cat("  ✔ Doublet calls saved\n")
   } else {
-    cat("  ✔ Doublet calls already exist\n")
+    cat("  ✔ Doublet calls already exist\n") #Note, this reruns anyway
     sce <- scDblFinder(sce)
   }
   
@@ -126,23 +143,37 @@ for (i in c("A", "B")) {
   print(table(sce$scDblFinder.class))
   
   # ── Gene annotation ─────────────────────────────────────────────────────────
-  rownames(sce) <- uniquifyFeatureNames(
-    rowData(sce)$ID,
-    rowData(sce)$Symbol
-  )
-  
+  if (all(c("ID","Symbol") %in% colnames(rowData(sce)))){
+      rownames(sce) <- uniquifyFeatureNames(
+      rowData(sce)$ID,
+      rowData(sce)$Symbol)
+      map_id = "GENEID"
+      ids= rowData(sce)$ID
+  } else{
+    rowData(sce)$Symbol =rownames(sce)
+    geneid <- mapIds(
+      x       = EnsDb.Hsapiens.v86,
+      keys    = rowData(sce)$Symbol,
+      keytype = "SYMBOL",
+      column  = "GENEID"
+    )
+    rowData(sce)$ID =geneid
+    map_id = "SYMBOL"
+    ids = rowData(sce)$Symbol 
+  }
+
   location <- mapIds(
     x       = EnsDb.Hsapiens.v86,
-    keys    = rowData(sce)$ID,
-    keytype = "GENEID",
+    keys    = ids,
+    keytype = map_id,
     column  = "SEQNAME"
   )
   rowData(sce)$CHR <- location
   
   biotype <- mapIds(
     x       = EnsDb.Hsapiens.v86,
-    keys    = rowData(sce)$ID,
-    keytype = "GENEID",
+    keys    = ids,
+    keytype = map_id,
     column  = "GENEBIOTYPE"
   )
   rowData(sce)$ENSEMBL.GENEBIOTYPE <- biotype
@@ -153,7 +184,7 @@ for (i in c("A", "B")) {
   ribo_genes <- grep("^RP(S|L)", rownames(sce), value = TRUE)
   ribo_set   <- union(
     ribo_genes,
-    c2_sets[c2_sets$gs_name == "KEGG_RIBOSOME", ]$human_gene_symbol
+    c2_sets[c2_sets$gs_name == "KEGG_RIBOSOME", ]$gene_symbol
   )
   
   sex_set        <- rownames(sce)[rowData(sce)$CHR %in% c("X", "Y")]
@@ -174,7 +205,7 @@ for (i in c("A", "B")) {
   )
   
   # ── QC plots ────────────────────────────────────────────────────────────────
-  pdf(here("output", "figures", "QC", glue("Pool_{i}_QC.pdf")),
+  pdf(here("output", "figures", "QC", glue("{i}_QC.pdf")),
       width = 12, height = 8)
   print(
     plotColData(sce, "sum",                  colour_by = "sum")      +
@@ -196,18 +227,21 @@ for (i in c("A", "B")) {
   cat("  Cells after doublet removal:", ncol(sce), "\n")
   
   # ── Assign vireo donor IDs ───────────────────────────────────────────────────
-  vireo_file <- here(glue("vireo_Flt_Pool_{i}_out"), "donor_ids.tsv")
-  if (!file.exists(vireo_file)) stop(glue("Vireo file not found: {vireo_file}"))
+  if ("vireo_id" %in% colnames(donor_meta)){
+    vireo_file <- here(glue("vireo_Flt_{i}_out"), "donor_ids.tsv")
+    if (!file.exists(vireo_file)) stop(glue("Vireo file not found: {vireo_file}"))
+    
+    vireo_df <- read.table(vireo_file, header = TRUE)
+    
+    j <- match(colnames(sce), vireo_df$cell)
+    
+    # Use donor_mapping from donor_meta.csv — no hard-coded vireo IDs
+    sce$genetic_donor <- factor(
+      dplyr::recode(vireo_df$donor_id[j], !!!donor_mapping),
+      levels = donor_levels
+    )
+  } else {warning("No vireo ids in donor_meta.csv; skipping vireo addition")}
   
-  vireo_df <- read.table(vireo_file, header = TRUE)
-  
-  j <- match(colnames(sce), vireo_df$cell)
-  
-  # Use donor_mapping from donor_meta.csv — no hard-coded vireo IDs
-  sce$genetic_donor <- factor(
-    dplyr::recode(vireo_df$donor_id[j], !!!donor_mapping),
-    levels = donor_levels
-  )
   
   # ── Attach donor metadata from CSV ──────────────────────────────────────────
   meta_join <- donor_meta[

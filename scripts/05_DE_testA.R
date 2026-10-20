@@ -4,8 +4,9 @@
 # Scripts are from /g/data/pq84/single_cell/10X/IBM/blood.R
 #
 # USAGE: Set CELLTYPE at the top, then source the script.
-#   Rscript 05_DE_analysis_celltype.R --args CD4
-#   or set CELLTYPE <- "CD4" manually below.
+#   Rscript 05_DE_analysis_celltype.R [CELLTYPE] [--wd /path/to/project_root]
+#   CELLTYPE defaults to "B"; --wd defaults to the current directory.
+#   --wd test  → uses the test_data project
 #
 # Supported CELLTYPE values:
 #   "all_cells"  — no cell-type subsetting
@@ -17,21 +18,57 @@
 #   "B"          — B naive, B intermediate, B memory, Plasmablast
 # ══════════════════════════════════════════════════════════════════════════════
 
-setwd("/g/data/pq84/single_cell/10X/scRNA_auto/all_data/GIMR_GGP_CIRCA_20250513_5P")
+args <- commandArgs(trailingOnly = TRUE)
+args <- args[args != "--args"]  # tolerate a stray --args
+
+WD_FLAGS <- c("--wd", "--project")
+flag_idx <- which(args %in% WD_FLAGS)
+
+if (length(flag_idx) > 0) {
+  val_idx <- flag_idx[1] + 1
+  if (val_idx > length(args) || startsWith(args[val_idx], "--")) {
+    stop("--wd needs a directory path after it")
+  }
+  PROJECT_ROOT <- args[val_idx]
+} else {
+  PROJECT_ROOT <- getwd()
+}
+
+if (PROJECT_ROOT == "test") {
+  PROJECT_ROOT <- "/g/data/pq84/sarahhp/projects/scauto/test_data"
+}
+PROJECT_ROOT <- normalizePath(PROJECT_ROOT, mustWork = TRUE)
+
+# Positional args = anything that isn't a flag or a flag's value
+positional <- args[setdiff(seq_along(args), c(flag_idx, flag_idx + 1))]
+CELLTYPE   <- if (length(positional) >= 1) positional[1] else "B"
+
+VALID_CELLTYPES <- c("all_cells", "CD4", "CD8", "Monocytes", "Naive", "NK", "B")
+if (!CELLTYPE %in% VALID_CELLTYPES) {
+  stop("Unknown CELLTYPE '", CELLTYPE, "'. Choose one of: ",
+       paste(VALID_CELLTYPES, collapse = ", "))
+}
+
+# ── Project root check ─────────────────────────────────────────────────────────
+has_marker <- file.exists(file.path(PROJECT_ROOT, ".here")) ||
+              any(grepl("\\.Rproj$", list.files(PROJECT_ROOT)))
+if (!has_marker) {
+  stop("project_root (", PROJECT_ROOT, ") doesn't look right — ",
+       "expected a .Rproj or .here file in that directory.")
+}
+
+setwd(PROJECT_ROOT)
+try(detach("package:here", unload = TRUE), silent = TRUE)
 library(here)
-here("/g/data/pq84/single_cell/10X/scRNA_auto/all_data/GIMR_GGP_CIRCA_20250513_5P/")
-here()
-# Force here() to use the new root
-library(here)
-here::set_here("/g/data/pq84/single_cell/10X/scRNA_auto/all_data/GIMR_GGP_CIRCA_20250513_5P")
-# Then restart R — set_here only takes effect in a new session
+
+if (normalizePath(here()) != PROJECT_ROOT) {
+  stop(glue::glue("here() resolved to {here()}, expected {PROJECT_ROOT}"))
+}
+cat("✔ Project root:", here(), "\n")
+cat("✔ Cell type:   ", CELLTYPE, "\n")
 
 # ── 0. Parameters ──────────────────────────────────────────────────────────────
-args     <- commandArgs(trailingOnly = TRUE)
-CELLTYPE <- if (length(args) > 0) args[1] else "B"
 SANITY_EXE <- "/g/data/pq84/andrew/software/Sanity/bin/Sanity"
-SEU_PATH   <- here("data", "SCEs", "Pools_A_B.annotated.SEU.rds")
-SEU_PATH   <- "/g/data/pq84/single_cell/10X/scRNA_auto/all_data/GIMR_GGP_CIRCA_20250513_5P/data/SCEs/Pools_A_B.annotated.SEU.rds"
 
 N_CORES    <- 4
 FDR_THRESH <- 0.05
@@ -109,8 +146,25 @@ target_subtypes <- CELLTYPE_MAP[[CELLTYPE]]
 
 # ── 3. Load Seurat object ──────────────────────────────────────────────────────
 cat("Loading Seurat object...\n")
+pool_names = unique(donor_meta$pool)
+#Add "Pool_" prefix  per name if pool names are short like "A", "B"
+full_pool_names <- ifelse(
+  stringr::str_length(pool_names) < 2,
+  paste0("Pool_", pool_names),
+  pool_names
+)
+
+#Naming convention for output file
+#Only save file as "Pools_{pool1}_{pool2}" if  there are 3 or less pools
+if (length(pool_names)<4){
+    joint_name = paste0("Pools_",paste(pool_names, collapse="_"))
+} else {
+    joint_name = paste0("All_pools_", format(Sys.Date("%Y-%m-%d")))
+}
+
+SEU_PATH <- here("data", "SCEs", glue("{joint_name}.annotated.SEU.rds"))
 seu <- readRDS(SEU_PATH)
-VariableFeatures(seu) <- rownames(seu@assays$integrated)
+#VariableFeatures(seu) <- rownames(seu@assays$integrated)
 
 # ── 4. Subset by cell type ─────────────────────────────────────────────────────
 if (!is.null(target_subtypes)) {
@@ -163,20 +217,25 @@ cat("\nRead count summary:\n")
 print(per_donor)
 
 # ── 7. Output directories ──────────────────────────────────────────────────────
-out_dir    <- here("output", "DE_analysis")
-sanity_dir <- here(out_dir, "sanity", CELLTYPE)
+#Making `CELLTYPE` the root dir for DE analysis
+out_dir    <- here("output", "DE_analysis", CELLTYPE)
+sanity_dir <- here(out_dir, "sanity")
 dir.create(sanity_dir, recursive = TRUE, showWarnings = FALSE)
 
+#Adding separate dir for limma output
+limma_dir <- here(out_dir, "limma")
+dir.create(limma_dir, recursive = TRUE, showWarnings = FALSE)
+
 write.csv(per_donor,
-          here(out_dir, glue("read_counts_per_donor_{CELLTYPE}.csv")),
+          here("output", "DE_analysis", glue("read_counts_per_donor_{CELLTYPE}.csv")),
           row.names = FALSE)
 
 # ── 8. Build Sanity count matrix ───────────────────────────────────────────────
-VariableFeatures(seu_sub) <- rownames(seu_sub@assays$integrated)
-variable_features          <- rownames(seu_sub@assays$integrated)
+#VariableFeatures(seu_sub) <- rownames(seu_sub@assays$integrated)
+filtered_features          <- rownames(seu_sub@assays$SCT)
 
 countmatrix <- as.matrix(
-  GetAssayData(seu_sub, assay = "RNA", layer = "counts")[variable_features, ]
+  GetAssayData(seu_sub, assay = "RNA", layer = "counts")[filtered_features, ]
 )
 cat(glue("\nCount matrix: {nrow(countmatrix)} genes × {ncol(countmatrix)} cells\n"))
 
@@ -294,7 +353,7 @@ colnames(design) <- gsub("cohort", "", colnames(design))
 cat("Design columns:", paste(colnames(design), collapse = ", "), "\n")
 
 # ── 14. duplicateCorrelation (parallel) ────────────────────────────────────────
-corfit_file <- here(sanity_dir, glue("corfit_{CELLTYPE}.RData"))
+corfit_file <- here(limma_dir, glue("corfit_{CELLTYPE}.RData"))
 
 if (file.exists(corfit_file)) {
   cat("✔ Loading cached corfit\n")
@@ -377,7 +436,7 @@ cat("Fitting limma model...\n")
 fit <- lmFit(expr, design,
              block       = donor,
              correlation = corfit$consensus.correlation)
-save(fit, file = here(sanity_dir, glue("limmafit_{CELLTYPE}.RData")))
+save(fit, file = here(limma_dir, glue("limmafit_{CELLTYPE}.RData")))
 
 fit <- contrasts.fit(fit, cm)
 fit <- eBayes(fit)
@@ -393,14 +452,15 @@ for (contrast_name in colnames(cm)) {
   cat(glue("  Significant (FDR < {FDR_THRESH}): {n_sig}\n"))
   
   tt$gene <- sub(".*_", "", rownames(tt))
-  write.csv(tt, here(sanity_dir, glue("{contrast_name}_topTable.csv")))
+  #Saving DE tables to DE_analysis/CELLTYPE
+  write.csv(tt, here(out_dir, glue("{contrast_name}_topTable.csv")))
   
   # GSEA rank file
   gseatt <- data.frame(gene = tt$gene, t = tt$t) %>%
     filter(!duplicated(gene)) %>%
     arrange(desc(t))
   write.table(gseatt,
-              file  = here(sanity_dir, glue("{contrast_name}_gsea.rnk")),
+              file  = here(limma_dir, glue("{contrast_name}_gsea.rnk")),
               sep   = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
   
   # Volcano plot
@@ -438,7 +498,7 @@ for (contrast_name in colnames(cm)) {
     theme(plot.title    = element_text(hjust = 0.5, face = "bold"),
           plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
   
-  ggsave(here(sanity_dir, glue("{contrast_name}_volcano.pdf")),
+  ggsave(here(limma_dir, glue("{contrast_name}_volcano.pdf")),
          plot = p, width = 10, height = 8)
   
   results_list[[contrast_name]] <- tt
@@ -454,356 +514,6 @@ for (contrast_name in names(results_list)) {
   cat(sprintf("  %-35s %d significant genes\n", contrast_name, n_sig))
 }
 
-saveRDS(results_list, here(sanity_dir, glue("all_DE_results_{CELLTYPE}.rds")))
-cat(glue("\n✔ All results saved to: {sanity_dir}\n\n"))
-
-
-
-
-
-
-
-### old 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 05_DE_analysis_celltype.R
-# Cell-type-aware Sanity + limma DE analysis
-# Scripts are from /g/data/pq84/single_cell/10X/IBM/blood.R
-# USAGE: Set CELLTYPE at the top, then source the script.
-#   Rscript 05_DE_analysis_celltype.R --args CD4
-#   or set CELLTYPE <- "CD4" manually below.
-#
-# Supported CELLTYPE values:
-#   "all_cells"  — no cell-type subsetting
-#   "CD4"        — CD4 TCM, TEM, Naive, CTL
-#   "CD8"        — CD8 TCM, TEM, Naive, CTL
-#   "Monocytes"  — CD14 Mono, CD16 Mono, cDC1, cDC2
-#   "Naive"      — CD4 Naive + CD8 Naive (combined naive T)
-#   "NK"         — NK, NK_CD56bright
-#   "B"          — B naive, B intermediate, B memory, Plasmablast
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ── 0. Parameters ──────────────────────────────────────────────────────────────
-args <- commandArgs(trailingOnly = TRUE)
-CELLTYPE <- if (length(args) > 0) args[1] else "CD4"   # <── change here if not using CLI
-
-# Sanity executable path (Gadi)
-SANITY_EXE <- "/g/data/pq84/andrew/software/Sanity/bin/Sanity"
-
-# Input Seurat object
-SEU_PATH <- here("data", "SCEs", "Pools_A_B.annotated.SEU.rds")
-
-# Number of parallel cores for duplicateCorrelation
-N_CORES <- 4
-
-# ── 1. Libraries ───────────────────────────────────────────────────────────────
-suppressPackageStartupMessages({
-  library(here)
-  library(Seurat)
-  library(Matrix)
-  library(dplyr)
-  library(tidyr)
-  library(ggplot2)
-  library(ggrepel)
-  library(limma)
-  library(statmod)
-  library(doParallel)
-  library(foreach)
-  library(glue)
-})
-
-
-# ── 2. Cell-type definitions ───────────────────────────────────────────────────
-# Map CELLTYPE label → predicted.celltype.l2 values (NULL = no subsetting)
-CELLTYPE_MAP <- list(
-  all_cells  = NULL,
-  CD4        = c("CD4 TCM", "CD4 TEM", "CD4 Naive", "CD4 CTL"),
-  CD8        = c("CD8 TCM", "CD8 TEM", "CD8 Naive", "CD8 CTL"),
-  Monocytes  = c("CD14 Mono", "CD16 Mono", "cDC1", "cDC2"),
-  Naive      = c("CD4 Naive", "CD8 Naive"),
-  NK         = c("NK", "NK_CD56bright"),
-  B          = c("B naive", "B intermediate", "B memory", "Plasmablast")
-)
-
-if (!CELLTYPE %in% names(CELLTYPE_MAP)) {
-  stop(glue(
-    "Unknown CELLTYPE '{CELLTYPE}'.\n",
-    "Choose from: {paste(names(CELLTYPE_MAP), collapse=', ')}"
-  ))
-}
-
-target_subtypes <- CELLTYPE_MAP[[CELLTYPE]]
-
-# ── 3. Load Seurat object ──────────────────────────────────────────────────────
-cat("Loading Seurat object...\n")
-seu <- readRDS(SEU_PATH)
-VariableFeatures(seu) <- rownames(seu@assays$integrated)
-
-# ── 4. Subset by cell type ─────────────────────────────────────────────────────
-if (!is.null(target_subtypes)) {
-  seu_sub <- subset(seu, predicted.celltype.l2 %in% target_subtypes)
-  cat(glue("Subsetting to {CELLTYPE}: {ncol(seu_sub)} cells retained\n"))
-} else {
-  seu_sub <- seu
-  cat(glue("Using all cells: {ncol(seu_sub)} cells\n"))
-}
-
-# ── 5. Cohort assignment ───────────────────────────────────────────────────────
-seu_sub$cohort <- case_when(
-  seu_sub$genetic_donor %in% c("ANGR", "LUMA") ~ "Healthy",
-  seu_sub$genetic_donor == "JATU"               ~ "BTK",
-  seu_sub$genetic_donor == "JAYU"               ~ "Fas",
-  seu_sub$genetic_donor == "GRCO"               ~ "STAT3_GOF",
-  seu_sub$genetic_donor == "NYOV"               ~ "STAT3_LOF"
-)
-
-cat("\nCohort breakdown:\n")
-print(table(seu_sub$cohort))
-
-# ── 6. Read count QC summary ───────────────────────────────────────────────────
-DefaultAssay(seu_sub) <- "RNA"
-seu_sub <- JoinLayers(seu_sub)
-
-count_matrix_full <- GetAssayData(seu_sub, assay = "RNA", layer = "counts")
-
-meta <- seu_sub@meta.data %>%
-  mutate(
-    cell_id      = rownames(.),
-    total_counts = Matrix::colSums(count_matrix_full),
-    n_genes      = Matrix::colSums(count_matrix_full > 0)
-  )
-
-per_donor <- meta %>%
-  group_by(genetic_donor, cohort) %>%
-  summarise(
-    n_cells           = n(),
-    total_reads       = sum(total_counts),
-    mean_reads_cell   = round(mean(total_counts),   1),
-    median_reads_cell = round(median(total_counts), 1),
-    mean_genes_cell   = round(mean(n_genes),        1),
-    .groups = "drop"
-  ) %>%
-  mutate(cohort = factor(cohort,
-                         levels = c("Healthy", "BTK", "Fas", "STAT3_GOF", "STAT3_LOF"))) %>%
-  arrange(cohort)
-
-cat("\nRead count summary:\n")
-print(per_donor)
-
-# ── 7. Output directories ──────────────────────────────────────────────────────
-out_dir    <- here("output", "DE_analysis")
-sanity_dir <- here(out_dir, "sanity", CELLTYPE)
-dir.create(sanity_dir, recursive = TRUE, showWarnings = FALSE)
-
-write.csv(per_donor,
-          here(out_dir, glue("read_counts_per_donor_{CELLTYPE}.csv")),
-          row.names = FALSE)
-
-# ── 8. Build Sanity count matrix ───────────────────────────────────────────────
-variable_features <- rownames(seu_sub@assays$integrated)
-countmatrix <- as.matrix(
-  GetAssayData(seu_sub, assay = "RNA", layer = "counts")[variable_features, ]
-)
-cat(glue("\nCount matrix: {nrow(countmatrix)} genes × {ncol(countmatrix)} cells\n"))
-
-forsanity <- rbind(colnames(countmatrix), countmatrix)
-forsanity  <- cbind(c("GeneID", rownames(countmatrix)), forsanity)
-
-countmatrix_file <- here(sanity_dir, "countmatrix.txt")
-if (!file.exists(countmatrix_file)) {
-  write.table(forsanity, file = countmatrix_file,
-              sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
-  cat("✔ Count matrix written\n")
-} else {
-  cat("✔ Count matrix already exists, skipping write\n")
-}
-
-# ── 9. Run Sanity ──────────────────────────────────────────────────────────────
-likelihood_file <- here(sanity_dir, "likelihood.txt")
-if (!file.exists(likelihood_file)) {
-  if (!file.exists(SANITY_EXE)) stop("Sanity not found at: ", SANITY_EXE)
-  cat("Running Sanity normalisation...\n")
-  system(paste(SANITY_EXE, "-n 28 -e 1 -f", countmatrix_file, "-d", sanity_dir))
-} else {
-  cat("✔ Sanity output already exists, skipping\n")
-}
-
-# ── 10. Load Sanity LTQs ───────────────────────────────────────────────────────
-expr <- read.table(here(sanity_dir, "log_transcription_quotients.txt"),
-                   row.names = 1, header = TRUE, stringsAsFactors = FALSE)
-expr <- data.matrix(expr)
-expr <- expr - min(expr)
-cat(glue("Expression matrix: {nrow(expr)} genes × {ncol(expr)} cells\n"))
-
-# ── 11. Metadata vectors ───────────────────────────────────────────────────────
-cohort <- as.character(seu_sub$cohort)
-donor  <- as.character(seu_sub$genetic_donor)
-
-# Identify cohorts actually present (important for subsetted cell types)
-cohorts_present <- sort(unique(cohort))
-cat("Cohorts present:", paste(cohorts_present, collapse = ", "), "\n")
-
-# ── 12. Design matrix ──────────────────────────────────────────────────────────
-design <- model.matrix(~0 + cohort)
-colnames(design) <- gsub("cohort", "", colnames(design))
-cat("Design columns:", paste(colnames(design), collapse = ", "), "\n")
-
-# ── 13. duplicateCorrelation (parallel) ────────────────────────────────────────
-# Only meaningful when >1 donor is present; guard is inside engine()
-corfit_file <- here(sanity_dir, glue("corfit_{CELLTYPE}.RData"))
-
-if (file.exists(corfit_file)) {
-  cat("✔ Loading cached corfit\n")
-  load(corfit_file)
-} else {
-  cat(glue("Calculating duplicateCorrelation on {N_CORES} cores...\n"))
-  
-  ngenes       <- nrow(expr)
-  nbeta        <- ncol(design)
-  MaxBlockSize <- max(table(donor))
-  weights      <- getEAWP(expr)$weights
-  Array        <- donor
-  nafun        <- function(e) NA
-  
-  engine <- function(i) {
-    y <- drop(expr[i, ])
-    o <- is.finite(y)
-    A <- factor(Array[o])
-    nobs    <- sum(o)
-    nblocks <- length(levels(A))
-    if (nobs > (nbeta + 2L) && nblocks > 1L && nblocks < (nobs - 1L)) {
-      y <- y[o]
-      X <- design[o, , drop = FALSE]
-      Z <- model.matrix(~0 + A)
-      s <- if (!is.null(weights)) {
-        w <- drop(weights[i, ])[o]
-        tryCatch(suppressWarnings(
-          mixedModel2Fit(y, X, Z, w, only.varcomp = TRUE, maxit = 20)$varcomp),
-          error = nafun)
-      } else {
-        tryCatch(suppressWarnings(
-          mixedModel2Fit(y, X, Z, only.varcomp = TRUE, maxit = 20)$varcomp),
-          error = nafun)
-      }
-      if (!is.na(s[1])) s[2] / sum(s)
-    }
-  }
-  
-  registerDoParallel(N_CORES)
-  rho <- foreach(i = seq_len(ngenes), .combine = "c") %dopar% { engine(i) }
-  stopImplicitCluster()
-  
-  rhomax <- 0.99
-  rhomin <- 1 / (1 - MaxBlockSize) + 0.01
-  m <- min(rho, 0, na.rm = TRUE); if (m < rhomin) rho[rho < rhomin] <- rhomin
-  m <- max(rho, 0, na.rm = TRUE); if (m > rhomax) rho[rho > rhomax] <- rhomax
-  
-  arho   <- atanh(rho)
-  mrho   <- tanh(mean(arho, trim = 0.15, na.rm = TRUE))
-  corfit <- list(consensus.correlation = mrho, cor = mrho, atanh.correlations = arho)
-  
-  cat(glue("Consensus correlation: {round(mrho, 4)}\n"))
-  save(corfit, file = corfit_file)
-}
-
-# ── 14. Build contrasts (only vs Healthy, only for cohorts present) ────────────
-# Healthy must be present to make any contrast
-if (!"Healthy" %in% cohorts_present) {
-  stop("Healthy cohort not found in this cell-type subset — check cell numbers per donor.")
-}
-
-disease_cohorts <- setdiff(cohorts_present, "Healthy")
-contrast_strings <- setNames(
-  paste0(disease_cohorts, " - Healthy"),
-  paste0(disease_cohorts, "_vs_Healthy")
-)
-
-cat("Contrasts to fit:\n")
-for (nm in names(contrast_strings)) cat(" ", nm, "\n")
-
-cm <- makeContrasts(contrasts = contrast_strings, levels = design)
-colnames(cm) <- names(contrast_strings)
-
-# ── 15. Fit limma model ────────────────────────────────────────────────────────
-cat("Fitting limma model...\n")
-fit <- lmFit(expr, design, block = donor, correlation = corfit$consensus.correlation)
-save(fit, file = here(sanity_dir, glue("limmafit_{CELLTYPE}.RData")))
-
-fit <- contrasts.fit(fit, cm)
-fit <- eBayes(fit)
-
-# ── 16. Extract results, GSEA rank files & volcano plots ──────────────────────
-results_list <- list()
-
-for (contrast_name in colnames(cm)) {
-  cat(glue("\nExtracting: {contrast_name}\n"))
-  
-  tt <- topTable(fit, coef = contrast_name, number = Inf, adjust.method = "BH")
-  n_sig <- sum(tt$adj.P.Val < 0.05)
-  cat(glue("  Significant (FDR < 0.05): {n_sig}\n"))
-  
-  # Clean gene names (strip "ENSG…_" prefix if present)
-  tt$gene <- sub(".*_", "", rownames(tt))
-  
-  # Save table
-  write.csv(tt, here(sanity_dir, glue("{contrast_name}_topTable.csv")))
-  
-  # GSEA rank file (t-statistic ranked)
-  gseatt <- data.frame(gene = tt$gene, t = tt$t) %>%
-    filter(!duplicated(gene)) %>%
-    arrange(desc(t))
-  write.table(gseatt,
-              file  = here(sanity_dir, glue("{contrast_name}_gsea.rnk")),
-              sep   = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
-  
-  # Volcano plot
-  disease_label <- gsub("_vs_Healthy", "", contrast_name)
-  volcano_df <- data.frame(
-    gene  = tt$gene,
-    logFC = tt$logFC,
-    logP  = -log10(tt$P.Value),
-    sig   = tt$adj.P.Val < 0.05
-  )
-  top_genes <- head(volcano_df[order(tt$adj.P.Val), ], 20)
-  
-  p <- ggplot(volcano_df, aes(x = logFC, y = logP)) +
-    geom_point(aes(color = sig), size = 1.5, alpha = 0.7) +
-    geom_text_repel(data = top_genes, aes(label = gene),
-                    box.padding = 0.5, size = 3, max.overlaps = 20) +
-    scale_color_manual(values = c("grey70", "red"), guide = "none") +
-    geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
-    geom_hline(yintercept = -log10(0.05), linetype = "dotted", color = "grey40") +
-    annotate("text", x = -Inf, y = Inf,
-             label = "← Higher in Healthy",
-             hjust = -0.05, vjust = 1.5, color = "steelblue", fontface = "bold", size = 3.5) +
-    annotate("text", x =  Inf, y = Inf,
-             label = paste0("Higher in ", disease_label, " →"),
-             hjust = 1.05, vjust = 1.5, color = "firebrick", fontface = "bold", size = 3.5) +
-    labs(
-      x     = "Log2 Fold Change",
-      y     = "-log10(P-value)",
-      title = glue("{CELLTYPE}: {contrast_name}"),
-      subtitle = glue("{n_sig} genes significant at FDR < 0.05")
-    ) +
-    theme_minimal(base_size = 12) +
-    theme(plot.title    = element_text(hjust = 0.5, face = "bold"),
-          plot.subtitle = element_text(hjust = 0.5, color = "grey40"))
-  
-  ggsave(here(sanity_dir, glue("{contrast_name}_volcano.pdf")),
-         plot = p, width = 10, height = 8)
-  
-  results_list[[contrast_name]] <- tt
-}
-
-# ── 17. Final summary ──────────────────────────────────────────────────────────
-cat(glue("  Cells analysed : {ncol(expr)}\n"))
-cat(glue("  Genes tested   : {nrow(expr)}\n\n"))
-
-for (contrast_name in names(results_list)) {
-  n_sig <- sum(results_list[[contrast_name]]$adj.P.Val < 0.05)
-  cat(sprintf("  %-35s %d significant genes\n", contrast_name, n_sig))
-}
-
-saveRDS(results_list, here(sanity_dir, glue("all_DE_results_{CELLTYPE}.rds")))
-cat(glue("\n✔ All results saved to: {sanity_dir}\n\n"))
+saveRDS(results_list, here(limma_dir, glue("all_DE_results_{CELLTYPE}.rds")))
+cat(glue("\n✔ All results saved to: {limma_dir}\n\n"))
 
